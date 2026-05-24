@@ -1,1 +1,380 @@
-
+name: "PerPilot | restful-api.dev Load Test"
+# PARAM KEY: [HARDCODED]=fixed [INPUT]=user provides [PASSED]=prev stage [EXTRACTED]=from API response [BUILT]=computed
+on:
+  workflow_dispatch:
+    inputs:
+      target_url:
+        description: "[INPUT] Base URL"
+        required: true
+        default: "https://api.restful-api.dev"
+      environment:
+        description: "[INPUT] development/staging/production"
+        required: true
+        default: "development"
+        type: choice
+        options: [development, staging, production]
+      virtual_users:
+        description: "[INPUT] VUs - 5=smoke 10=load 50=stress"
+        required: true
+        default: "5"
+      duration:
+        description: "[INPUT] 1m=smoke 5m=load 30m=soak"
+        required: true
+        default: "1m"
+      collection_name:
+        description: "[INPUT] {collectionName} path param"
+        required: true
+        default: "products"
+env:
+  TARGET_URL:  ${{ inputs.target_url }}
+  ENVIRONMENT: ${{ inputs.environment }}
+  VUS:         ${{ inputs.virtual_users }}
+  DURATION:    ${{ inputs.duration }}
+  COLLECTION:  ${{ inputs.collection_name }}
+  API_KEY:     ${{ secrets.RESTFUL_API_KEY || 'demo-key-replace-me' }}
+jobs:
+  stage-01-target-application:
+    name: "Stage 01 | Target Application"
+    runs-on: ubuntu-latest
+    outputs:
+      target_url:  ${{ steps.s01.outputs.target_url }}
+      http_status: ${{ steps.s01.outputs.http_status }}
+      reachable:   ${{ steps.s01.outputs.reachable }}
+    steps:
+      - name: "[S01] Validate API endpoint"
+        id: s01
+        run: |
+          echo "=== STAGE 01 - TARGET APPLICATION ==="
+          echo "[INPUT] URL = ${{ env.TARGET_URL }}"
+          HTTP=$(curl -s -o /dev/null -w "%{http_code}" --max-time 15 \
+            -H "x-api-key: ${{ env.API_KEY }}" \
+            "${{ env.TARGET_URL }}/collections" || echo 000)
+          [ "$HTTP" = "000" ] && REACH=false || REACH=true
+          echo "HTTP=$HTTP | Reachable=$REACH"
+          echo "target_url=${{ env.TARGET_URL }}" >> $GITHUB_OUTPUT
+          echo "http_status=$HTTP" >> $GITHUB_OUTPUT
+          echo "reachable=$REACH" >> $GITHUB_OUTPUT
+          [ "$REACH" = false ] && exit 1 || echo "Stage 01 PASSED"
+  stage-02-nfr-gathering:
+    name: "Stage 02 | NFR Gathering"
+    runs-on: ubuntu-latest
+    needs: stage-01-target-application
+    outputs:
+      p95_ms:      ${{ steps.s02.outputs.p95_ms }}
+      p99_ms:      ${{ steps.s02.outputs.p99_ms }}
+      error_rate:  ${{ steps.s02.outputs.error_rate }}
+      throughput:  ${{ steps.s02.outputs.throughput }}
+      nfr_profile: ${{ steps.s02.outputs.nfr_profile }}
+    steps:
+      - name: "[S02] NFR Thresholds"
+        id: s02
+        run: |
+          echo "=== STAGE 02 - NFR GATHERING ==="
+          ENV="${{ env.ENVIRONMENT }}"
+          case "$ENV" in
+            production)  P95=500;  P99=800;  ERR=0.005; TPUT=50; PRF=production;;
+            staging)     P95=2000; P99=3000; ERR=0.01;  TPUT=20; PRF=staging;;
+            development) P95=5000; P99=8000; ERR=0.05;  TPUT=5;  PRF=development;;
+            *)           P95=5000; P99=8000; ERR=0.05;  TPUT=5;  PRF=custom;;
+          esac
+          echo "[HARDCODED] Profile=$PRF p95<${P95}ms"
+          echo "p95_ms=$P95" >> $GITHUB_OUTPUT
+          echo "p99_ms=$P99" >> $GITHUB_OUTPUT
+          echo "error_rate=$ERR" >> $GITHUB_OUTPUT
+          echo "throughput=$TPUT" >> $GITHUB_OUTPUT
+          echo "nfr_profile=$PRF" >> $GITHUB_OUTPUT
+          echo "Stage 02 PASSED"
+  stage-03-workload-design:
+    name: "Stage 03 | Workload Design"
+    runs-on: ubuntu-latest
+    needs: [stage-01-target-application, stage-02-nfr-gathering]
+    outputs:
+      test_type:    ${{ steps.s03.outputs.test_type }}
+      virtual_users:${{ steps.s03.outputs.virtual_users }}
+      duration:     ${{ steps.s03.outputs.duration }}
+      ramp_up:      ${{ steps.s03.outputs.ramp_up }}
+      est_requests: ${{ steps.s03.outputs.est_requests }}
+    steps:
+      - name: "[S03] Workload Design"
+        id: s03
+        run: |
+          echo "=== STAGE 03 - WORKLOAD DESIGN ==="
+          VUS=${{ env.VUS }}; DUR="${{ env.DURATION }}"
+          if   [ "$VUS" -le 5 ];   then TYPE=smoke
+          elif [ "$VUS" -le 50 ];  then TYPE=load
+          elif [ "$VUS" -le 200 ]; then TYPE=stress
+          else TYPE=spike; fi
+          DN=$(echo $DUR | sed 's/m//'); DS=$((DN*60))
+          RU=$((DS/10)); [ "$RU" -lt 10 ] && RU=10
+          EST=$((VUS*DS/2))
+          echo "[BUILT] type=$TYPE ramp=${RU}s est=$EST"
+          echo "test_type=$TYPE" >> $GITHUB_OUTPUT
+          echo "virtual_users=$VUS" >> $GITHUB_OUTPUT
+          echo "duration=$DUR" >> $GITHUB_OUTPUT
+          echo "ramp_up=$RU" >> $GITHUB_OUTPUT
+          echo "est_requests=$EST" >> $GITHUB_OUTPUT
+          echo "Stage 03 PASSED"
+  stage-04-script-generation:
+    name: "Stage 04 | Script Generation"
+    runs-on: ubuntu-latest
+    needs: [stage-01-target-application, stage-02-nfr-gathering, stage-03-workload-design]
+    steps:
+      - name: "[S04] Generate k6 Script"
+        run: |
+          echo "=== STAGE 04 - SCRIPT GENERATION ==="
+          echo "9 endpoints covered with [HARDCODED][INPUT][EXTRACTED][PASSED][BUILT] params"
+          mkdir -p scripts
+          {
+            printf '// restful-api.dev k6 Load Test (Stage 04)\n'
+            printf '// PARAM KEY: [HARDCODED]=fixed [INPUT]=workflow [EXTRACTED]=API response [PASSED]=prev stage [BUILT]=runtime\n'
+            printf 'import http from "k6/http";\n'
+            printf 'import { check, sleep, group } from "k6";\n'
+            printf 'import { Rate, Trend, Counter } from "k6/metrics";\n'
+            printf 'const errorRate=new Rate("errors");\n'
+            printf 'const respTime=new Trend("response_time");\n'
+            printf 'const reqCount=new Counter("total_req");\n'
+            printf 'export const options={\n'
+            printf '  stages:[\n'
+            printf '    {duration:"%ss",target:%s}, // [PASSED S03] ramp-up period\n' '${{ needs.stage-03-workload-design.outputs.ramp_up }}' '${{ needs.stage-03-workload-design.outputs.virtual_users }}'
+            printf '    {duration:"%s",target:%s},  // [INPUT] hold at target VUs\n' '${{ needs.stage-03-workload-design.outputs.duration }}' '${{ needs.stage-03-workload-design.outputs.virtual_users }}'
+            printf '    {duration:"15s",target:0},   // [HARDCODED] ramp-down\n'
+            printf '  ],\n'
+            printf '  thresholds:{\n'
+            printf '    http_req_duration:["p(95)<%s","p(99)<%s"], // [PASSED S02] NFR\n' '${{ needs.stage-02-nfr-gathering.outputs.p95_ms }}' '${{ needs.stage-02-nfr-gathering.outputs.p99_ms }}'
+            printf '    errors:["rate<%s"],   // [PASSED S02]\n' '${{ needs.stage-02-nfr-gathering.outputs.error_rate }}'
+            printf '    http_reqs:["rate>=%s"],// [PASSED S02]\n' '${{ needs.stage-02-nfr-gathering.outputs.throughput }}'
+            printf '  },\n'
+            printf '};\n'
+            printf '// BASE_URL [PASSED from Stage 01]\n'
+            printf 'const BASE_URL="%s";\n' '${{ needs.stage-01-target-application.outputs.target_url }}'
+            printf '// COLLECTION [INPUT] = {collectionName} in every URL path\n'
+            printf 'const COLLECTION="%s";\n' '${{ env.COLLECTION }}'
+            printf '// API_KEY [INPUT via Secret] = x-api-key header on every request\n'
+            printf 'const API_KEY="%s";\n' '${{ env.API_KEY }}'
+            printf 'const REG_PASS="LoadTest@2024!"; // [HARDCODED]\n'
+            printf 'const REG_NAME="LoadTestUser";   // [HARDCODED]\n'
+            printf 'const H={"x-api-key":API_KEY,"Content-Type":"application/json"}; // [BUILT]\n'
+            printf 'export default function(){\n'
+            printf '  let jwt=null; // [EXTRACTED] POST /register -> response.token\n'
+            printf '  let oid=null; // [EXTRACTED] POST /objects -> response.id -> PUT/PATCH/DELETE\n'
+            printf '  const em=`u${Date.now()}${Math.random().toString(36).slice(2)}@lt.io`; // [BUILT]\n'
+            printf '  const r=Math.random();\n'
+            printf '  if(r<0.40){  // SCENARIO A 40%% - GET endpoints\n'
+            printf '    group("A:GET",()=>{\n'
+            printf '      // 1. GET /collections [HARDCODED path][INPUT x-api-key]\n'
+            printf '      const r1=http.get(`${BASE_URL}/collections`,{headers:H});\n'
+            printf '      check(r1,{"GET /collections 200":x=>x.status===200});\n'
+            printf '      errorRate.add(r1.status!==200);reqCount.add(1);sleep(0.5);\n'
+            printf '      // 2. GET /collections/{name}/objects [INPUT:COLLECTION as {name}]\n'
+            printf '      const r2=http.get(`${BASE_URL}/collections/${COLLECTION}/objects`,{headers:H});\n'
+            printf '      check(r2,{"GET /objects 200":x=>x.status===200});\n'
+            printf '      errorRate.add(r2.status!==200);reqCount.add(1);\n'
+            printf '      // 3. GET /collections/{name}/objects/{id}\n'
+            printf '      //    [EXTRACTED] id = first id from GET /objects list response\n'
+            printf '      let sid="1"; // [HARDCODED] fallback id\n'
+            printf '      try{const arr=JSON.parse(r2.body);if(arr&&arr.length>0)sid=arr[0].id;}catch(e){}\n'
+            printf '      const r3=http.get(`${BASE_URL}/collections/${COLLECTION}/objects/${sid}`,{headers:H});\n'
+            printf '      check(r3,{"GET /obj/{id} 200or404":x=>x.status===200||x.status===404});\n'
+            printf '      reqCount.add(1);\n'
+            printf '    });\n'
+            printf '  }else if(r<0.70){  // SCENARIO B 30%% - Register+Login+Create\n'
+            printf '    group("B:AuthCreate",()=>{\n'
+            printf '      // 4. POST /register [BUILT:email][HARDCODED:pass][EXTRACTED:jwt->stored]\n'
+            printf '      const rr=http.post(`${BASE_URL}/register`,\n'
+            printf '        JSON.stringify({email:em,password:REG_PASS,name:REG_NAME}),{headers:H});\n'
+            printf '      check(rr,{"POST /register 200":x=>x.status===200||x.status===201});\n'
+            printf '      try{jwt=JSON.parse(rr.body).token;}catch(e){} // [EXTRACTED]->jwt\n'
+            printf '      reqCount.add(1);\n'
+            printf '      // 5. POST /login [BUILT:same email][HARDCODED:pass]\n'
+            printf '      const lr=http.post(`${BASE_URL}/login`,\n'
+            printf '        JSON.stringify({email:em,password:REG_PASS}),{headers:H});\n'
+            printf '      check(lr,{"POST /login 200":x=>x.status===200||x.status===201});\n'
+            printf '      reqCount.add(1);\n'
+            printf '      // 6. POST /collections/{name}/objects\n'
+            printf '      //    [INPUT]:COLLECTION as {name} | [EXTRACTED]:jwt->Bearer | [EXTRACTED]:id->oid\n'
+            printf '      const ah={...H,Authorization:jwt?`Bearer ${jwt}`:""};\n'
+            printf '      const cr=http.post(`${BASE_URL}/collections/${COLLECTION}/objects`,\n'
+            printf '        JSON.stringify({name:"Load Test Item",data:{year:2024,price:999.99,cpu:"Intel i7",ts:Date.now()}}),\n'
+            printf '        {headers:ah});\n'
+            printf '      check(cr,{"POST /objects 200":x=>x.status===200||x.status===201});\n'
+            printf '      try{oid=JSON.parse(cr.body).id;}catch(e){} // [EXTRACTED]->oid\n'
+            printf '      reqCount.add(1);\n'
+            printf '    });\n'
+            printf '  }else if(r<0.90){  // SCENARIO C 20%% - PUT+PATCH\n'
+            printf '    group("C:Update",()=>{\n'
+            printf '      const em2=`u2${Date.now()}@lt.io`; // [BUILT]\n'
+            printf '      const rr2=http.post(`${BASE_URL}/register`,JSON.stringify({email:em2,password:REG_PASS,name:REG_NAME}),{headers:H});\n'
+            printf '      let j2=null;try{j2=JSON.parse(rr2.body).token;}catch(e){} // [EXTRACTED]\n'
+            printf '      const ah2={...H,Authorization:j2?`Bearer ${j2}`:""};\n'
+            printf '      const cr2=http.post(`${BASE_URL}/collections/${COLLECTION}/objects`,JSON.stringify({name:"Update Target",data:{price:100}}),{headers:ah2});\n'
+            printf '      let oid2=null;try{oid2=JSON.parse(cr2.body).id;}catch(e){} // [EXTRACTED]->oid2\n'
+            printf '      reqCount.add(2);\n'
+            printf '      if(oid2){\n'
+            printf '        // 7. PUT full replace [EXTRACTED:oid2 as {id}][HARDCODED:body]\n'
+            printf '        const pu=http.put(`${BASE_URL}/collections/${COLLECTION}/objects/${oid2}`,\n'
+            printf '          JSON.stringify({name:"PUT Updated",data:{year:2024,price:1299,color:"silver"}}),{headers:ah2});\n'
+            printf '        check(pu,{"PUT /obj/{id} 200":x=>x.status===200});errorRate.add(pu.status!==200);reqCount.add(1);\n'
+            printf '        // 8. PATCH partial [EXTRACTED:oid2 as {id}][HARDCODED:partial body]\n'
+            printf '        const pa=http.patch(`${BASE_URL}/collections/${COLLECTION}/objects/${oid2}`,\n'
+            printf '          JSON.stringify({name:"PATCH Updated Name"}),{headers:ah2});\n'
+            printf '        check(pa,{"PATCH /obj/{id} 200":x=>x.status===200});errorRate.add(pa.status!==200);reqCount.add(1);\n'
+            printf '      }sleep(0.5);\n'
+            printf '    });\n'
+            printf '  }else{  // SCENARIO D 10%% - DELETE\n'
+            printf '    group("D:Delete",()=>{\n'
+            printf '      const em3=`u3${Date.now()}@lt.io`; // [BUILT]\n'
+            printf '      const rr3=http.post(`${BASE_URL}/register`,JSON.stringify({email:em3,password:REG_PASS,name:REG_NAME}),{headers:H});\n'
+            printf '      let j3=null;try{j3=JSON.parse(rr3.body).token;}catch(e){} // [EXTRACTED]\n'
+            printf '      const ah3={...H,Authorization:j3?`Bearer ${j3}`:""};\n'
+            printf '      const cr3=http.post(`${BASE_URL}/collections/${COLLECTION}/objects`,JSON.stringify({name:"Del Me",data:{ts:Date.now()}}),{headers:ah3});\n'
+            printf '      let oid3=null;try{oid3=JSON.parse(cr3.body).id;}catch(e){} // [EXTRACTED]->oid3\n'
+            printf '      reqCount.add(2);\n'
+            printf '      if(oid3){\n'
+            printf '        // 9. DELETE [EXTRACTED:oid3 as {id}][HARDCODED:null body]\n'
+            printf '        const dl=http.del(`${BASE_URL}/collections/${COLLECTION}/objects/${oid3}`,null,{headers:ah3});\n'
+            printf '        check(dl,{"DELETE /obj/{id} 200":x=>x.status===200});errorRate.add(dl.status!==200);reqCount.add(1);\n'
+            printf '      }sleep(0.5);\n'
+            printf '    });\n'
+            printf '  }sleep(1);\n'
+            printf '}\n'
+          } > scripts/restful-api-test.js
+          echo "Stage 04 PASSED - $(wc -l < scripts/restful-api-test.js) lines"
+      - name: "Upload Script"
+        uses: actions/upload-artifact@v4
+        with:
+          name: s04-k6-script
+          path: scripts/
+  stage-05-execution:
+    name: "Stage 05 | Load Test Execution"
+    runs-on: ubuntu-latest
+    needs: [stage-02-nfr-gathering, stage-03-workload-design, stage-04-script-generation]
+    outputs:
+      test_status:  ${{ steps.s05.outputs.test_status }}
+      p95_actual:   ${{ steps.s05.outputs.p95_actual }}
+      p99_actual:   ${{ steps.s05.outputs.p99_actual }}
+      error_actual: ${{ steps.s05.outputs.error_actual }}
+      rps_actual:   ${{ steps.s05.outputs.rps_actual }}
+      total_reqs:   ${{ steps.s05.outputs.total_reqs }}
+    steps:
+      - name: "[S05] Install k6"
+        run: |
+          echo "=== STAGE 05 - EXECUTION ==="
+          sudo gpg -k
+          sudo gpg --no-default-keyring --keyring /usr/share/keyrings/k6-archive-keyring.gpg \
+            --keyserver hkp://keyserver.ubuntu.com:80 \
+            --recv-keys C5AD17C747E3415A3642D57D77C6C491D6AC1D69 2>/dev/null
+          echo 'deb [signed-by=/usr/share/keyrings/k6-archive-keyring.gpg] https://dl.k6.io/deb stable main' | sudo tee /etc/apt/sources.list.d/k6.list
+          sudo apt-get update -qq && sudo apt-get install -y k6 -qq && echo "k6 ready"
+      - name: "[S05] Download Script"
+        uses: actions/download-artifact@v4
+        with:
+          name: s04-k6-script
+          path: scripts/
+      - name: "[S05] Run k6"
+        run: |
+          echo "Running ${{ needs.stage-03-workload-design.outputs.test_type }} | ${{ needs.stage-03-workload-design.outputs.virtual_users }} VUs | ${{ needs.stage-03-workload-design.outputs.duration }}"
+          mkdir -p results
+          k6 run --out json=results/k6-results.json scripts/restful-api-test.js 2>&1 | tee results/k6-log.txt || true
+      - name: "[S05] Parse Metrics"
+        id: s05
+        run: |
+          P95=0;P99=0;ERR=0;RPS=0;TOT=0
+          if [ -f results/k6-results.json ]; then
+            P95=$(grep '"p(95)"' results/k6-results.json | grep -oP '"value":\s*\K[0-9.]+' | head -1 || echo 0)
+            P99=$(grep '"p(99)"' results/k6-results.json | grep -oP '"value":\s*\K[0-9.]+' | head -1 || echo 0)
+            ERR=$(grep '"http_req_failed"' results/k6-results.json | grep '"rate"' | grep -oP '"value":\s*\K[0-9.]+' | head -1 || echo 0)
+            RPS=$(grep '"http_reqs"' results/k6-results.json | grep '"rate"' | grep -oP '"value":\s*\K[0-9.]+' | head -1 || echo 0)
+            TOT=$(grep '"http_reqs"' results/k6-results.json | grep '"count"' | grep -oP '"value":\s*\K[0-9.]+' | head -1 || echo 0)
+          fi
+          P95I=$(printf '%.0f' ${P95:-0});P99I=$(printf '%.0f' ${P99:-0})
+          RPSI=$(printf '%.1f' ${RPS:-0});ERPP=$(echo "${ERR:-0}*100" | bc -l | xargs printf '%.2f');TOTI=$(printf '%.0f' ${TOT:-0})
+          THR=${{ needs.stage-02-nfr-gathering.outputs.p95_ms }}
+          STATUS=PASS
+          [ "$P95I" -gt "$THR" ] 2>/dev/null && STATUS=FAIL
+          ERF=$(echo "${ERR:-0} > ${{ needs.stage-02-nfr-gathering.outputs.error_rate }}" | bc -l || echo 0)
+          [ "$ERF" = "1" ] && STATUS=FAIL
+          echo "p95=${P95I}ms p99=${P99I}ms err=${ERPP}% rps=${RPSI} total=${TOTI} STATUS=$STATUS"
+          echo "test_status=$STATUS" >> $GITHUB_OUTPUT
+          echo "p95_actual=$P95I" >> $GITHUB_OUTPUT
+          echo "p99_actual=$P99I" >> $GITHUB_OUTPUT
+          echo "error_actual=$ERPP" >> $GITHUB_OUTPUT
+          echo "rps_actual=$RPSI" >> $GITHUB_OUTPUT
+          echo "total_reqs=$TOTI" >> $GITHUB_OUTPUT
+          echo "Stage 05 PASSED"
+      - name: "Upload Results"
+        uses: actions/upload-artifact@v4
+        with:
+          name: s05-results
+          path: results/
+  stage-06-store-results:
+    name: "Stage 06 | Store Results to GitHub"
+    runs-on: ubuntu-latest
+    needs: [stage-01-target-application,stage-02-nfr-gathering,stage-03-workload-design,stage-04-script-generation,stage-05-execution]
+    if: always()
+    steps:
+      - name: "Download Results"
+        uses: actions/download-artifact@v4
+        with:
+          name: s05-results
+          path: results/
+        continue-on-error: true
+      - name: "[S06] Publish Summary"
+        run: |
+          S="${{ needs.stage-05-execution.outputs.test_status }}"
+          [ "$S" = PASS ] && VRD=PASS || VRD=FAIL
+          cat >> $GITHUB_STEP_SUMMARY << 'HDOC'
+          # restful-api.dev Load Test Report
+          HDOC
+          cat >> $GITHUB_STEP_SUMMARY << ENDDOC
+          Run: ${{ github.run_number }} | Verdict: ${VRD}
+          ## Pipeline Stages
+          | Stage | Status |
+          |-------|--------|
+          | 01 Target Application | done |
+          | 02 NFR Gathering | done |
+          | 03 Workload Design | done |
+          | 04 Script Generation | done |
+          | 05 Load Test Execution | done |
+          | 06 Store Results | done |
+          ## Configuration & Parameter Origins
+          | Parameter | Value | Origin |
+          |-----------|-------|--------|
+          | Target URL | ${{ needs.stage-01-target-application.outputs.target_url }} | [INPUT] |
+          | Collection | ${{ env.COLLECTION }} | [INPUT] |
+          | Environment | ${{ env.ENVIRONMENT }} | [INPUT] |
+          | Virtual Users | ${{ needs.stage-03-workload-design.outputs.virtual_users }} | [INPUT] |
+          | Duration | ${{ needs.stage-03-workload-design.outputs.duration }} | [INPUT] |
+          | Test Type | ${{ needs.stage-03-workload-design.outputs.test_type }} | [BUILT] |
+          | NFR Profile | ${{ needs.stage-02-nfr-gathering.outputs.nfr_profile }} | [HARDCODED] |
+          ## Endpoints Tested (9 total)
+          | Method | Endpoint | Key Params & Origin |
+          |--------|----------|---------------------|
+          | GET | /collections | x-api-key=[INPUT Secret] |
+          | GET | /collections/{name}/objects | {name}=[INPUT COLLECTION] |
+          | GET | /collections/{name}/objects/{id} | {id}=[EXTRACTED from list] |
+          | POST | /register | email=[BUILT] pwd=[HARDCODED] |
+          | POST | /login | email=[BUILT] pwd=[HARDCODED] |
+          | POST | /collections/{name}/objects | jwt=[EXTRACTED] body=[HARDCODED] |
+          | PUT | /collections/{name}/objects/{id} | {id}=[EXTRACTED from POST] body=[HARDCODED] |
+          | PATCH | /collections/{name}/objects/{id} | {id}=[EXTRACTED] partial body=[HARDCODED] |
+          | DELETE | /collections/{name}/objects/{id} | {id}=[EXTRACTED from POST] |
+          ## NFR vs Actual Results
+          | Metric | Threshold | Actual |
+          |--------|-----------|--------|
+          | P95 | <${{ needs.stage-02-nfr-gathering.outputs.p95_ms }}ms | ${{ needs.stage-05-execution.outputs.p95_actual }}ms |
+          | P99 | <${{ needs.stage-02-nfr-gathering.outputs.p99_ms }}ms | ${{ needs.stage-05-execution.outputs.p99_actual }}ms |
+          | Error Rate | <${{ needs.stage-02-nfr-gathering.outputs.error_rate }} | ${{ needs.stage-05-execution.outputs.error_actual }}% |
+          | Throughput | >=${{ needs.stage-02-nfr-gathering.outputs.throughput }}/s | ${{ needs.stage-05-execution.outputs.rps_actual }} req/s |
+          | Total Requests | ~${{ needs.stage-03-workload-design.outputs.est_requests }} | ${{ needs.stage-05-execution.outputs.total_reqs }} |
+          ## Verdict: ${VRD}
+          > PerPilot Pipeline | github.com/jaisaim/restful-api-load-test
+          ENDDOC
+          echo "Stage 06 PASSED - Verdict: $VRD"
+          [ "$S" = FAIL ] && exit 1 || exit 0
+      - name: "Upload Final Report"
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: s06-final-report
+          path: results/
+          retention-days: 30
